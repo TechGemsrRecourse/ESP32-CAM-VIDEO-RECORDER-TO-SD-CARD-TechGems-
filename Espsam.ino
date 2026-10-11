@@ -1,12 +1,22 @@
 /*
- * ESP32-CAM One-Button Video Recorder  (AI-Thinker pinout)
+ * ESP32-CAM One-Button Video Recorder  (AI-Thinker pinout)  - v2
  * - Button between GPIO 12 and GND (internal pull-up used)
  * - Press once: start recording to SD (1-bit mode), red LED ON
  * - Press again: stop, finalize AVI file, red LED OFF
- * - VGA 640x480 Motion-JPEG in an AVI container (plays in VLC, many players)
+ * - VGA 640x480 Motion-JPEG in an AVI container (plays in VLC and most players)
+ *
+ * v2 fixes:
+ * - Button uses an interrupt, so a press is never missed during slow SD writes
+ * - Camera and SD start once and stay initialised (reliable 2nd, 3rd... recordings)
+ * - Every write is checked; card full / write error stops and closes the file safely
+ * - Errors blink the LED and return to idle (no reset needed)
+ *
+ * License: MIT
  */
 
 #include "esp_camera.h"
+#include "esp_timer.h"
+#include "driver/gpio.h"
 #include "FS.h"
 #include "SD_MMC.h"
 #include "soc/soc.h"
@@ -39,20 +49,33 @@
 #define FRAME_W        640
 #define FRAME_H        480
 #define JPEG_QUALITY   12        // 10 = better/larger, 15 = smaller. 12 is a stable middle.
-#define MAX_FRAMES     30000     // safety limit (~30+ min); auto-stops when reached
+#define MAX_FRAMES     30000     // safety limit; auto-stops when reached
 #define HEADER_SIZE    224
 
 // ---------- State ----------
 bool recording = false;
+bool sdReady = false;
+bool camReady = false;
 File aviFile;
 uint32_t frameCount = 0;
 uint32_t moviBytes = 0;
 uint32_t startMs = 0;
 uint32_t *idxTable = nullptr;    // pairs: offset, size (stored in PSRAM)
+uint32_t nullFrames = 0;
 
-// ---------- Button debounce ----------
-bool lastBtn = HIGH;
-uint32_t lastChangeMs = 0;
+// ---------- Button (interrupt based) ----------
+volatile bool btnFlag = false;
+volatile uint32_t lastHighMs = 0;
+
+void IRAM_ATTR onButton() {
+  uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+  if (gpio_get_level((gpio_num_t)BUTTON_PIN)) {
+    lastHighMs = now;                       // released (or bounce)
+  } else if (now - lastHighMs > 60) {       // real press after stable HIGH
+    btnFlag = true;
+    lastHighMs = now;
+  }
+}
 
 // ---------- Little-endian helpers ----------
 static void put32(uint8_t *b, int off, uint32_t v) {
@@ -101,8 +124,9 @@ static void patch32(uint32_t pos, uint32_t v) {
 // ---------- LED ----------
 static void redLed(bool on) { digitalWrite(RED_LED_PIN, on ? LOW : HIGH); }
 
-static void errorBlink() {         // endless fast blink = something failed
-  while (true) { redLed(true); delay(150); redLed(false); delay(150); }
+// Fast blink = error. Blinks for a few seconds, then returns to idle.
+static void errorBlink() {
+  for (int i = 0; i < 12; i++) { redLed(true); delay(150); redLed(false); delay(150); }
 }
 
 // ---------- Camera ----------
@@ -136,50 +160,14 @@ static String nextFilename() {
   return String("/video_9999.avi");
 }
 
-// ---------- Start / Stop ----------
-static void startRecording() {
-  // SD card in 1-bit mode (frees GPIO 4, 12, 13)
-  if (!SD_MMC.begin("/sdcard", true)) {
-    Serial.println("SD card mount failed");
-    errorBlink();
-  }
-  pinMode(FLASH_PIN, OUTPUT);
-  digitalWrite(FLASH_PIN, LOW);            // keep white flash off
-
-  if (SD_MMC.cardType() == CARD_NONE) { Serial.println("No SD card"); errorBlink(); }
-
-  if (!startCamera()) { Serial.println("Camera init failed"); errorBlink(); }
-
-  if (!idxTable) idxTable = (uint32_t *)ps_malloc((size_t)MAX_FRAMES * 8);
-  if (!idxTable) { Serial.println("Index alloc failed"); errorBlink(); }
-
-  String fn = nextFilename();
-  aviFile = SD_MMC.open(fn.c_str(), FILE_WRITE);
-  if (!aviFile) { Serial.println("Cannot open file"); errorBlink(); }
-
-  uint8_t hdr[HEADER_SIZE];
-  buildHeader(hdr);
-  aviFile.write(hdr, HEADER_SIZE);
-
-  frameCount = 0;
-  moviBytes = 0;
-
-  // let auto-exposure settle: discard a few frames
-  for (int i = 0; i < 3; i++) {
-    camera_fb_t *f = esp_camera_fb_get();
-    if (f) esp_camera_fb_return(f);
-  }
-
-  startMs = millis();
-  recording = true;
-  redLed(true);
-  Serial.printf("Recording to %s\n", fn.c_str());
-}
-
+// ---------- Stop ----------
 static void stopRecording() {
   recording = false;                       // halt frame stream first
   uint32_t elapsed = millis() - startMs;
   if (elapsed == 0) elapsed = 1;
+
+  // go back to the end of the last good frame (discards any partial write)
+  aviFile.seek(HEADER_SIZE + moviBytes);
 
   // write idx1 index
   uint8_t chunk[16 * 64];
@@ -217,15 +205,82 @@ static void stopRecording() {
   aviFile.flush();
   aviFile.close();
 
-  esp_camera_deinit();                     // camera fully idle again
-  SD_MMC.end();                            // safe to remove card now
-  redLed(false);
+  redLed(false);                           // file is safe: LED off
   Serial.printf("Saved %u frames, %.1f fps\n", frameCount, fpsX1000 / 1000.0);
 }
 
+// ---------- Start ----------
+static void startRecording() {
+  // SD card in 1-bit mode (mounted once, stays mounted)
+  if (!sdReady) {
+    if (!SD_MMC.begin("/sdcard", true) || SD_MMC.cardType() == CARD_NONE) {
+      Serial.println("SD card mount failed (check card is inserted and FAT32)");
+      SD_MMC.end();
+      errorBlink();
+      return;
+    }
+    sdReady = true;
+    pinMode(BUTTON_PIN, INPUT_PULLUP);     // make sure pull-up is still on
+    pinMode(FLASH_PIN, OUTPUT);
+    digitalWrite(FLASH_PIN, LOW);          // keep white flash off
+  }
+
+  // Camera starts once, stays initialised
+  if (!camReady) {
+    if (!startCamera()) {
+      Serial.println("Camera init failed (check ribbon cable and PSRAM setting)");
+      errorBlink();
+      return;
+    }
+    camReady = true;
+  }
+
+  if (!idxTable) idxTable = (uint32_t *)ps_malloc((size_t)MAX_FRAMES * 8);
+  if (!idxTable) { Serial.println("Index memory alloc failed (enable PSRAM)"); errorBlink(); return; }
+
+  String fn = nextFilename();
+  aviFile = SD_MMC.open(fn.c_str(), FILE_WRITE);
+  if (!aviFile) {
+    Serial.println("Cannot open file (card removed?) - will remount on next press");
+    SD_MMC.end();
+    sdReady = false;
+    errorBlink();
+    return;
+  }
+
+  uint8_t hdr[HEADER_SIZE];
+  buildHeader(hdr);
+  if (aviFile.write(hdr, HEADER_SIZE) != HEADER_SIZE) {
+    Serial.println("Header write failed");
+    aviFile.close();
+    errorBlink();
+    return;
+  }
+
+  frameCount = 0;
+  moviBytes = 0;
+  nullFrames = 0;
+
+  // let auto-exposure settle: discard a few frames
+  for (int i = 0; i < 3; i++) {
+    camera_fb_t *f = esp_camera_fb_get();
+    if (f) esp_camera_fb_return(f);
+  }
+
+  startMs = millis();
+  recording = true;
+  redLed(true);
+  Serial.printf("Recording to %s\n", fn.c_str());
+}
+
+// ---------- One frame ----------
 static void recordOneFrame() {
   camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb) return;
+  if (!fb) {
+    if (++nullFrames > 100) { Serial.println("Camera stopped giving frames"); stopRecording(); }
+    return;
+  }
+  nullFrames = 0;
 
   uint32_t len = fb->len;
   uint32_t padded = (len + 1) & ~1U;       // AVI chunks must be even-sized
@@ -233,19 +288,28 @@ static void recordOneFrame() {
   uint8_t h[8];
   putTag(h, 0, "00dc"); put32(h, 4, len);
 
-  idxTable[frameCount * 2]     = 4 + moviBytes;   // offset relative to 'movi'
-  idxTable[frameCount * 2 + 1] = len;
-
-  aviFile.write(h, 8);
-  aviFile.write(fb->buf, len);
-  if (padded != len) { uint8_t z = 0; aviFile.write(&z, 1); }
-
-  moviBytes += 8 + padded;
-  frameCount++;
+  size_t w1 = aviFile.write(h, 8);
+  size_t w2 = aviFile.write(fb->buf, len);
+  size_t w3 = 1;
+  if (padded != len) { uint8_t z = 0; w3 = aviFile.write(&z, 1); }
   esp_camera_fb_return(fb);
 
+  if (w1 != 8 || w2 != len || w3 != 1) {   // card full or write error
+    Serial.println("SD write error (card full?) - stopping and saving");
+    stopRecording();
+    return;
+  }
+
+  idxTable[frameCount * 2]     = 4 + moviBytes;   // offset relative to 'movi'
+  idxTable[frameCount * 2 + 1] = len;
+  moviBytes += 8 + padded;
+  frameCount++;
+
   if ((frameCount % 100) == 0) aviFile.flush();   // limit data loss on power cut
-  if (frameCount >= MAX_FRAMES) stopRecording();  // safety stop
+  if (frameCount >= MAX_FRAMES) {
+    Serial.println("Frame limit reached - stopping");
+    stopRecording();
+  }
 }
 
 // ---------- Arduino ----------
@@ -255,20 +319,17 @@ void setup() {
   pinMode(RED_LED_PIN, OUTPUT);
   redLed(false);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), onButton, CHANGE);
   Serial.println("Ready. Press the button to start/stop recording.");
 }
 
 void loop() {
-  // button handling with 50 ms debounce (falling edge = press)
-  bool btn = digitalRead(BUTTON_PIN);
-  if (btn != lastBtn && millis() - lastChangeMs > 50) {
-    lastChangeMs = millis();
-    lastBtn = btn;
-    if (btn == LOW) {
-      if (!recording) startRecording();
-      else            stopRecording();
-    }
+  if (btnFlag) {
+    btnFlag = false;
+    if (!recording) { startRecording(); btnFlag = false; }
+    else            { stopRecording(); }
   }
 
   if (recording) recordOneFrame();
+  else delay(10);
 }
