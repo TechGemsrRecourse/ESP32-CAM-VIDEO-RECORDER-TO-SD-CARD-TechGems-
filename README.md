@@ -2,6 +2,9 @@
 
 A simple, single-file Arduino sketch that turns an AI-Thinker ESP32-CAM into a standalone video recorder controlled by one push-button. Press once to start recording to the SD card, press again to stop. No Wi-Fi, no web server, no extra libraries or tabs.
 
+## Wiring Diagram
+<img src="circuit_image.png" width="700" alt="ESP32-CAM wiring diagram">
+
 ## Features
 
 - **One button control:** press to start, press again to stop
